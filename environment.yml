@@ -1,0 +1,13 @@
+name: KGR
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - tqdm
+  - python=3.7
+  - numpy
+  - tensorboardx
+  - cudatoolkit
+  - pytorch
+  - torchvision
+prefix: /home/dongt/anaconda3/envs/KGR

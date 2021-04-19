@@ -1,4 +1,3 @@
-
 # FB15k-237
 CUDA_VISIBLE_DEVICES=0 python main.py --cuda --do_train --do_valid --do_test \
   --data_path data/FB15k-237-betae -n 128 -b 512 -d 800 -g 24 \

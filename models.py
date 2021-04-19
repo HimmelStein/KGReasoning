@@ -7,6 +7,8 @@ from __future__ import print_function
 import logging
 import numpy as np
 import torch
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -19,9 +21,36 @@ import itertools
 import time
 from tqdm import tqdm
 import os
+import util_cone as uc
+import cone
 
 def Identity(x):
     return x
+
+
+class AngleOffsetIntersection(nn.Module):
+    def __init__(self, dim):
+        super(AngleOffsetIntersection, self).__init__()
+        self.dim = dim
+        self.layer1 = nn.Linear(self.dim, self.dim)
+        self.layer2 = nn.Linear(self.dim, self.dim)
+
+        nn.init.xavier_uniform_(self.layer1.weight)
+        nn.init.xavier_uniform_(self.layer2.weight)
+
+    def forward(self, embeddings):
+        #print("in forward of AngleOffsetIntersection, embedding shape ", embeddings.shape)
+        layer1_act = F.relu(self.layer1(embeddings))
+
+        layer1_mean = torch.mean(layer1_act, dim=0)
+        #print(layer1_mean.shape)
+        gate = torch.sigmoid(self.layer2(layer1_mean))
+        #print('gate ', gate)
+        #print(gate.shape)
+        offset, _ = torch.min(embeddings, dim=0)
+        #print('offset ', offset)
+        #print(offset.shape)
+        return offset * gate
 
 class BoxOffsetIntersection(nn.Module):
     
@@ -36,10 +65,15 @@ class BoxOffsetIntersection(nn.Module):
 
     def forward(self, embeddings):
         layer1_act = F.relu(self.layer1(embeddings))
-        layer1_mean = torch.mean(layer1_act, dim=0) 
+        #print(embeddings.shape)
+        layer1_mean = torch.mean(layer1_act, dim=0)
+        #print(layer1_mean.shape)
         gate = torch.sigmoid(self.layer2(layer1_mean))
+        #print('gate ', gate)
+        #print(gate.shape)
         offset, _ = torch.min(embeddings, dim=0)
-
+        #print('offset ', offset)
+        #print(offset.shape)
         return offset * gate
 
 class CenterIntersection(nn.Module):
@@ -55,9 +89,14 @@ class CenterIntersection(nn.Module):
 
     def forward(self, embeddings):
         layer1_act = F.relu(self.layer1(embeddings)) # (num_conj, dim)
+        #print("embeddings: ",embeddings.shape)
+        #print("layer1_act", layer1_act.shape)
         attention = F.softmax(self.layer2(layer1_act), dim=0) # (num_conj, dim)
-        embedding = torch.sum(attention * embeddings, dim=0)
-
+        #print("attention:", attention.shape)
+        ae = attention * embeddings
+        #print("attention * embeddings:", ae.shape)
+        embedding = torch.sum(ae, dim=0)
+        #print(embedding.shape)
         return embedding
 
 class BetaIntersection(nn.Module):
@@ -117,7 +156,7 @@ class Regularizer():
 class KGReasoning(nn.Module):
     def __init__(self, nentity, nrelation, hidden_dim, gamma, 
                  geo, test_batch_size=1,
-                 box_mode=None, use_cuda=False,
+                 box_mode=None, cone_mode=None, use_cuda=False,
                  query_name_dict=None, beta_mode=None):
         super(KGReasoning, self).__init__()
         self.nentity = nentity
@@ -140,9 +179,24 @@ class KGReasoning(nn.Module):
         )
         
         self.entity_dim = hidden_dim
-        self.relation_dim = hidden_dim
+        if self.geo == 'cone':
+            self.relation_dim = hidden_dim - 1
+        else:
+            self.relation_dim = hidden_dim
+
+        #print("size of self.relation_dim", self.relation_dim)
         
-        if self.geo == 'box':
+        if self.geo == 'cone':
+            self.entity_embedding = nn.Parameter(torch.zeros(nentity, self.entity_dim)) # centor for entities
+            activation, cen = cone_mode
+            self.cen = cen # hyperparameter that balances the in-box distance and the out-box distance
+            if activation == 'none':
+                self.func = Identity
+            elif activation == 'relu':
+                self.func = F.relu
+            elif activation == 'softplus':
+                self.func = F.softplus
+        elif self.geo == 'box':
             self.entity_embedding = nn.Parameter(torch.zeros(nentity, self.entity_dim)) # centor for entities
             activation, cen = box_mode
             self.cen = cen # hyperparameter that balances the in-box distance and the out-box distance
@@ -158,11 +212,21 @@ class KGReasoning(nn.Module):
             self.entity_embedding = nn.Parameter(torch.zeros(nentity, self.entity_dim * 2)) # alpha and beta
             self.entity_regularizer = Regularizer(1, 0.05, 1e9) # make sure the parameters of beta embeddings are positive
             self.projection_regularizer = Regularizer(1, 0.05, 1e9) # make sure the parameters of beta embeddings after relation projection are positive
-        nn.init.uniform_(
-            tensor=self.entity_embedding, 
-            a=-self.embedding_range.item(), 
-            b=self.embedding_range.item()
-        )
+        if self.geo == 'cone':
+            while True:
+                nn.init.uniform_(self.entity_embedding)
+                len_vec = self.entity_embedding.sum(dim=1)
+                if len((len_vec == 0).nonzero()) == 0:
+                    len_vec = cone.SphereRadius/ torch.norm(self.entity_embedding, dim=1)
+                    diag = torch.diag(len_vec)
+                    self.entity_embedding = torch.nn.Parameter(diag @ self.entity_embedding, requires_grad=True)
+                    break
+        else:
+            nn.init.uniform_(
+                tensor=self.entity_embedding,
+                a=-self.embedding_range.item(),
+                b=self.embedding_range.item()
+            )
 
         self.relation_embedding = nn.Parameter(torch.zeros(nrelation, self.relation_dim))
         nn.init.uniform_(
@@ -171,8 +235,19 @@ class KGReasoning(nn.Module):
             b=self.embedding_range.item()
         )
 
-        if self.geo == 'box':
+        if self.geo == 'cone':
             self.offset_embedding = nn.Parameter(torch.zeros(nrelation, self.entity_dim))
+            # print("self.offset_embedding", self.offset_embedding.shape)
+            nn.init.uniform_(
+                tensor=self.offset_embedding,
+                a=0.,
+                b=self.embedding_range.item()
+            )
+            self.center_net = CenterIntersection(self.entity_dim)
+            self.offset_net = AngleOffsetIntersection(self.entity_dim)
+        elif self.geo == 'box':
+            self.offset_embedding = nn.Parameter(torch.zeros(nrelation, self.entity_dim))
+            #print("self.offset_embedding", self.offset_embedding.shape)
             nn.init.uniform_(
                 tensor=self.offset_embedding, 
                 a=0., 
@@ -192,14 +267,16 @@ class KGReasoning(nn.Module):
                                              num_layers)
 
     def forward(self, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict):
-        if self.geo == 'box':
+        if self.geo == 'cone':
+            return self.forward_cone(positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
+        elif self.geo == 'box':
             return self.forward_box(positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
         elif self.geo == 'vec':
             return self.forward_vec(positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
         elif self.geo == 'beta':
             return self.forward_beta(positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict)
 
-    def embed_query_box(self, queries, query_structure, idx):
+    def embed_query_cone(self, queries, query_structure, idx):
         '''
         Iterative embed a batch of queries with same structure using Query2box
         queries: a flattened batch of queries
@@ -216,15 +293,87 @@ class KGReasoning(nn.Module):
                     offset_embedding = torch.zeros_like(embedding).cuda()
                 else:
                     offset_embedding = torch.zeros_like(embedding)
+                #print("offset_embedding e", offset_embedding.shape)
+                idx += 1
+
+            else:
+                embedding, offset_embedding, idx = self.embed_query_cone(queries, query_structure[0], idx)
+            for i in range(len(query_structure[-1])):
+                if query_structure[-1][i] == 'n':
+                    "cone can easily handle queries with negation"
+                    embedding = - torch.index_select(self.entity_embedding, dim=0, index=queries[:, idx])
+                    #print("embedding ", self.embedding.shape)
+                    #print("offset_embedding 1", self.offset_embedding.shape)
+                    offset_embedding = np.pi - torch.index_select(self.offset_embedding, dim=0, index=queries[:, idx])
+                    #print("offset_embedding 2", offset_embedding.shape)
+
+                else:
+                    "cone projection shall be transformed into polar coordinates"
+                    "self.relation_embedding is only in polar coordinates"
+                    rel_embedding = torch.index_select(self.relation_embedding, dim=0, index=queries[:, idx])
+                    # print("offset_embedding 1", self.offset_embedding.shape)
+                    rel_offset_embedding = torch.index_select(self.offset_embedding, dim=0, index=queries[:, idx])
+                    #print("rel_embedding ", rel_embedding.shape)
+                    #print("rel_offset_embedding ", rel_offset_embedding.shape)
+
+                    polar_embedding = torch.from_numpy(uc.x2theta(embedding)).float().cuda()
+                    #print("p_embedding ", polar_embedding.shape)
+                    polar_embedding += rel_embedding
+                    embedding = torch.from_numpy(uc.theta2x(polar_embedding, cone.SphereRadius)).float().cuda()
+                    #print("size of embedding", embedding.shape)
+                    #print("size of rel_offset_embedding", rel_offset_embedding.shape)
+                    offset_embedding += self.func(rel_offset_embedding)
+                    #print("size of offset_embedding 0", offset_embedding.shape)
+
+                idx += 1
+        else:
+            embedding_list = []
+            offset_embedding_list = []
+            for i in range(len(query_structure)):
+                embedding, offset_embedding, idx = self.embed_query_cone(queries, query_structure[i], idx)
+                embedding_list.append(embedding)
+                offset_embedding_list.append(offset_embedding)
+                #print("offset_embedding size", offset_embedding.shape)
+            embedding = self.center_net(torch.stack(embedding_list))
+
+            offset_embedding = self.offset_net(torch.stack(offset_embedding_list))
+            #print("offset_embedding 2 size", offset_embedding.shape)
+
+        return embedding, offset_embedding, idx
+
+    def embed_query_box(self, queries, query_structure, idx):
+        '''
+        Iterative embed a batch of queries with same structure using Query2box
+        queries: a flattened batch of queries
+        '''
+        all_relation_flag = True
+        for ele in query_structure[-1]: # whether the current query tree has merged to one branch and only need to do relation traversal, e.g., path queries or conjunctive queries after the intersection
+            if ele not in ['r', 'n']:
+                all_relation_flag = False
+                break
+        if all_relation_flag:
+            if query_structure[0] == 'e':
+                embedding = torch.index_select(self.entity_embedding, dim=0, index=queries[:, idx])
+                #print("embedding 0", embedding.shape)
+                if self.use_cuda:
+                    offset_embedding = torch.zeros_like(embedding).cuda()
+                else:
+                    offset_embedding = torch.zeros_like(embedding)
+                #print("offset_embedding 1", offset_embedding.shape)
                 idx += 1
             else:
                 embedding, offset_embedding, idx = self.embed_query_box(queries, query_structure[0], idx)
+                #print("offset_embedding 3", offset_embedding.shape)
             for i in range(len(query_structure[-1])):
                 if query_structure[-1][i] == 'n':
                     assert False, "box cannot handle queries with negation"
                 else:
                     r_embedding = torch.index_select(self.relation_embedding, dim=0, index=queries[:, idx])
+                    #print("size of r_embedding", r_embedding.shape)
+                    #print("offset_embedding 4", offset_embedding.shape)
                     r_offset_embedding = torch.index_select(self.offset_embedding, dim=0, index=queries[:, idx])
+                    #print("size of r_offset_embedding", r_offset_embedding.shape)
+                    #print("size of embedding", embedding.shape)
                     embedding += r_embedding
                     offset_embedding += self.func(r_offset_embedding)
                 idx += 1
@@ -233,10 +382,12 @@ class KGReasoning(nn.Module):
             offset_embedding_list = []
             for i in range(len(query_structure)):
                 embedding, offset_embedding, idx = self.embed_query_box(queries, query_structure[i], idx)
+                #print("offset_embedding size", offset_embedding.shape)
                 embedding_list.append(embedding)
                 offset_embedding_list.append(offset_embedding)
             embedding = self.center_net(torch.stack(embedding_list))
             offset_embedding = self.offset_net(torch.stack(offset_embedding_list))
+            #print("offset_embedding 2 size", offset_embedding.shape)
 
         return embedding, offset_embedding, idx
 
@@ -410,12 +561,147 @@ class KGReasoning(nn.Module):
         elif self.query_name_dict[query_structure] == 'up-DNF':
             return ('e', ('r', 'r'))
 
+    def cal_logit_cone(self, entity_embedding, query_center_embedding, query_offset):
+        """need to check"""
+        sz = list(entity_embedding.size())
+        #print("entity_embedding shape", sz)
+        if len(sz) == 4: # == [1,1,14505,400]:
+            #print(type(entity_embedding))
+            entity_embedding = torch.reshape(entity_embedding, sz[1:])
+            #print("entity_embedding new shape", list(entity_embedding.size()))
+            sz = list(entity_embedding.size())
+
+        ent_emb = entity_embedding/torch.norm(entity_embedding, p=2, dim=-1).view(sz[:-1]+[1])
+        #print("ent_emb shape", ent_emb.size())
+
+        q_sz = list(query_center_embedding.size())
+        #print("q_sz shape", q_sz)
+        if q_sz == [1,2,1,400]:
+            query_center_embedding = torch.reshape(query_center_embedding, (2,1,400))
+            query_center_embedding = torch.split(query_center_embedding, 1)[0]
+            q_sz = list(query_center_embedding.size())
+
+        q_emb = query_center_embedding / torch.norm(query_center_embedding, p=2, dim=-1).view(q_sz[:-1]+[1])
+        #print("q_emb shape", q_emb.size())
+
+        ent_emb1 = ent_emb.reshape([sz[0]*sz[1], sz[-1]])
+        sz1 = list(ent_emb1.size())
+
+        #print('q_sz[0], sz[1], q_sz[-1]', q_sz[0], sz[1], q_sz[-1])
+
+        q_emb1 = q_emb.repeat(1, sz[1], 1)
+        q_sz = list(q_emb1.size())
+        #print('q_sz', q_sz)
+        q_emb2 = q_emb1.reshape(q_sz[0]*q_sz[1], q_sz[-1])
+        q_sz = list(q_emb2.size())
+
+        q_sz = q_sz[:1] + [1] + q_sz[-1:]
+        #print("q_sz",  q_sz)
+        sz1 += [1]
+        #print("sz1", sz1)
+        delta_cos = torch.bmm(q_emb2.view(q_sz),ent_emb1.view(sz1))
+        delta_cos = delta_cos.reshape([sz[0],sz[1],1])
+        #print("delta_cos", delta_cos.size())
+        delta = torch.acos(delta_cos)
+        #print("delta", delta.size())
+        #print("query_offset", query_offset.size())
+        distance_out = F.relu(delta - query_offset)
+        distance_in = torch.min(delta, query_offset)
+        logit = self.gamma - torch.norm(distance_out, p=1, dim=-1) - self.cen * torch.norm(distance_in, p=1, dim=-1)
+        #print("distance_out shape", distance_out.size())
+        #print("distance_in shape", distance_in.size())
+        #print("logit shape", logit.size())
+        return logit
+
     def cal_logit_box(self, entity_embedding, query_center_embedding, query_offset_embedding):
+        sz = list(entity_embedding.size())
+        #print("entity_embedding.size()",sz)
+        #if sz[1] != 1:
+        #    print("query_center_embedding.size()", query_center_embedding.size())
+        #   print('')
         delta = (entity_embedding - query_center_embedding).abs()
         distance_out = F.relu(delta - query_offset_embedding)
         distance_in = torch.min(delta, query_offset_embedding)
         logit = self.gamma - torch.norm(distance_out, p=1, dim=-1) - self.cen * torch.norm(distance_in, p=1, dim=-1)
+        #print("distance_out shape", distance_out.size())
+        #print("distance_in shape", distance_in.size())
+        #print("logit shape", logit.size())
         return logit
+
+    def forward_cone(self, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict):
+        all_center_embeddings, all_offset_embeddings, all_idxs = [], [], []
+        all_union_center_embeddings, all_union_offset_embeddings, all_union_idxs = [], [], []
+        for query_structure in batch_queries_dict:
+            if 'u' in self.query_name_dict[query_structure]:
+                center_embedding, offset_embedding, _ = \
+                    self.embed_query_cone(self.transform_union_query(batch_queries_dict[query_structure],
+                                                                    query_structure),
+                                         self.transform_union_structure(query_structure),
+                                         0)
+                all_union_center_embeddings.append(center_embedding)
+                all_union_offset_embeddings.append(offset_embedding)
+                all_union_idxs.extend(batch_idxs_dict[query_structure])
+            else:
+                center_embedding, offset_embedding, _ = self.embed_query_cone(batch_queries_dict[query_structure],
+                                                                             query_structure,
+                                                                             0)
+                all_center_embeddings.append(center_embedding)
+                all_offset_embeddings.append(offset_embedding)
+                all_idxs.extend(batch_idxs_dict[query_structure])
+
+        if len(all_center_embeddings) > 0 and len(all_offset_embeddings) > 0:
+            all_center_embeddings = torch.cat(all_center_embeddings, dim=0).unsqueeze(1)
+            all_offset_embeddings = torch.cat(all_offset_embeddings, dim=0).unsqueeze(1)
+        if len(all_union_center_embeddings) > 0 and len(all_union_offset_embeddings) > 0:
+            all_union_center_embeddings = torch.cat(all_union_center_embeddings, dim=0).unsqueeze(1)
+            all_union_offset_embeddings = torch.cat(all_union_offset_embeddings, dim=0).unsqueeze(1)
+            all_union_center_embeddings = all_union_center_embeddings.view(all_union_center_embeddings.shape[0]//2, 2, 1, -1)
+            all_union_offset_embeddings = all_union_offset_embeddings.view(all_union_offset_embeddings.shape[0]//2, 2, 1, -1)
+
+        if type(subsampling_weight) != type(None):
+            subsampling_weight = subsampling_weight[all_idxs+all_union_idxs]
+
+        if type(positive_sample) != type(None):
+            if len(all_center_embeddings) > 0:
+                positive_sample_regular = positive_sample[all_idxs]
+                positive_embedding = torch.index_select(self.entity_embedding, dim=0, index=positive_sample_regular).unsqueeze(1)
+                positive_logit = self.cal_logit_cone(positive_embedding, all_center_embeddings, all_offset_embeddings)
+            else:
+                positive_logit = torch.Tensor([]).to(self.entity_embedding.device)
+
+            if len(all_union_center_embeddings) > 0:
+                positive_sample_union = positive_sample[all_union_idxs]
+                positive_embedding = torch.index_select(self.entity_embedding, dim=0, index=positive_sample_union).unsqueeze(1).unsqueeze(1)
+                positive_union_logit = self.cal_logit_cone(positive_embedding, all_union_center_embeddings, all_union_offset_embeddings)
+                positive_union_logit = torch.max(positive_union_logit, dim=1)[0]
+            else:
+                positive_union_logit = torch.Tensor([]).to(self.entity_embedding.device)
+            positive_logit = torch.cat([positive_logit, positive_union_logit], dim=0)
+        else:
+            positive_logit = None
+
+        if type(negative_sample) != type(None):
+            if len(all_center_embeddings) > 0:
+                negative_sample_regular = negative_sample[all_idxs]
+                batch_size, negative_size = negative_sample_regular.shape
+                negative_embedding = torch.index_select(self.entity_embedding, dim=0, index=negative_sample_regular.view(-1)).view(batch_size, negative_size, -1)
+                negative_logit = self.cal_logit_cone(negative_embedding, all_center_embeddings, all_offset_embeddings)
+            else:
+                negative_logit = torch.Tensor([]).to(self.entity_embedding.device)
+
+            if len(all_union_center_embeddings) > 0:
+                negative_sample_union = negative_sample[all_union_idxs]
+                batch_size, negative_size = negative_sample_union.shape
+                negative_embedding = torch.index_select(self.entity_embedding, dim=0, index=negative_sample_union.view(-1)).view(batch_size, 1, negative_size, -1)
+                negative_union_logit = self.cal_logit_cone(negative_embedding, all_union_center_embeddings, all_union_offset_embeddings)
+                negative_union_logit = torch.max(negative_union_logit, dim=1)[0]
+            else:
+                negative_union_logit = torch.Tensor([]).to(self.entity_embedding.device)
+            negative_logit = torch.cat([negative_logit, negative_union_logit], dim=0)
+        else:
+            negative_logit = None
+
+        return positive_logit, negative_logit, subsampling_weight, all_idxs+all_union_idxs
 
     def forward_box(self, positive_sample, negative_sample, subsampling_weight, batch_queries_dict, batch_idxs_dict):
         all_center_embeddings, all_offset_embeddings, all_idxs = [], [], []
@@ -609,6 +895,7 @@ class KGReasoning(nn.Module):
 
         step = 0
         total_steps = len(test_dataloader)
+        logs = collections.defaultdict(list)
         logs = collections.defaultdict(list)
 
         with torch.no_grad():

@@ -22,7 +22,11 @@ from collections import defaultdict
 from tqdm import tqdm
 from util import flatten_query, list2tuple, parse_time, set_global_seed, eval_tuple
 
-query_name_dict = {('e',('r',)): '1p', 
+query_name_dict = { (('e', ('r',)), ('e', ('r',)), ('u',)): '2u-DNF',
+                    ((('e', ('r',)), ('e', ('r',)), ('u',)), ('r',)): 'up-DNF',
+                    ((('e', ('r', 'n')), ('e', ('r', 'n'))), ('n',)): '2u-DM',
+                    ((('e', ('r', 'n')), ('e', ('r', 'n'))), ('n', 'r')): 'up-DM',
+                    ('e',('r',)): '1p',
                     ('e', ('r', 'r')): '2p',
                     ('e', ('r', 'r', 'r')): '3p',
                     (('e', ('r',)), ('e', ('r',))): '2i',
@@ -33,11 +37,11 @@ query_name_dict = {('e',('r',)): '1p',
                     (('e', ('r',)), ('e', ('r',)), ('e', ('r', 'n'))): '3in',
                     ((('e', ('r',)), ('e', ('r', 'n'))), ('r',)): 'inp',
                     (('e', ('r', 'r')), ('e', ('r', 'n'))): 'pin',
-                    (('e', ('r', 'r', 'n')), ('e', ('r',))): 'pni',
-                    (('e', ('r',)), ('e', ('r',)), ('u',)): '2u-DNF',
-                    ((('e', ('r',)), ('e', ('r',)), ('u',)), ('r',)): 'up-DNF',
-                    ((('e', ('r', 'n')), ('e', ('r', 'n'))), ('n',)): '2u-DM',
-                    ((('e', ('r', 'n')), ('e', ('r', 'n'))), ('n', 'r')): 'up-DM'
+                    (('e', ('r', 'r', 'n')), ('e', ('r',))): 'pni'
+                    #(('e', ('r',)), ('e', ('r',)), ('u',)): '2u-DNF',
+                    #((('e', ('r',)), ('e', ('r',)), ('u',)), ('r',)): 'up-DNF',
+                    #((('e', ('r', 'n')), ('e', ('r', 'n'))), ('n',)): '2u-DM',
+                    #((('e', ('r', 'n')), ('e', ('r', 'n'))), ('n', 'r')): 'up-DM'
                 }
 name_query_dict = {value: key for key, value in query_name_dict.items()}
 all_tasks = list(name_query_dict.keys()) # ['1p', '2p', '3p', '2i', '3i', 'ip', 'pi', '2in', '3in', 'inp', 'pin', 'pni', '2u-DNF', '2u-DM', 'up-DNF', 'up-DM']
@@ -74,11 +78,12 @@ def parse_args(args=None):
     parser.add_argument('--nentity', type=int, default=0, help='DO NOT MANUALLY SET')
     parser.add_argument('--nrelation', type=int, default=0, help='DO NOT MANUALLY SET')
     
-    parser.add_argument('--geo', default='vec', type=str, choices=['vec', 'box', 'beta'], help='the reasoning model, vec for GQE, box for Query2box, beta for BetaE')
+    parser.add_argument('--geo', default='vec', type=str, choices=['cone', 'vec', 'box', 'beta'], help='the reasoning model, cone for SphericalCone, vec for GQE, box for Query2box, beta for BetaE')
     parser.add_argument('--print_on_screen', action='store_true')
     
     parser.add_argument('--tasks', default='1p.2p.3p.2i.3i.ip.pi.2in.3in.inp.pin.pni.2u.up', type=str, help="tasks connected by dot, refer to the BetaE paper for detailed meaning and structure of each task")
     parser.add_argument('--seed', default=0, type=int, help="random seed")
+    parser.add_argument('-conem', '--cone_mode', default="(none,0.02)", type=str, help='(hidden_dim,num_layer) for SphericalCone relational projection')
     parser.add_argument('-betam', '--beta_mode', default="(1600,2)", type=str, help='(hidden_dim,num_layer) for BetaE relational projection')
     parser.add_argument('-boxm', '--box_mode', default="(none,0.02)", type=str, help='(offset activation,center_reg) for Query2box, center_reg balances the in_box dist and out_box dist')
     parser.add_argument('--prefix', default=None, type=str, help='prefix of the log path')
@@ -197,7 +202,7 @@ def main(args):
     set_global_seed(args.seed)
     tasks = args.tasks.split('.')
     for task in tasks:
-        if 'n' in task and args.geo in ['box', 'vec']:
+        if 'n' in task and args.geo in ['cone', 'box', 'vec']:
             assert False, "Q2B and GQE cannot handle queries with negation"
     if args.evaluate_union == 'DM':
         assert args.geo == 'beta', "only BetaE supports modeling union using De Morgan's Laws"
@@ -209,13 +214,16 @@ def main(args):
         prefix = args.prefix
 
     print ("overwritting args.save_path")
-    args.save_path = os.path.join(prefix, args.data_path.split('/')[-1], args.tasks, args.geo)
+    args.save_path = os.path.join(prefix, args.data_path.split('/')[-1], args.tasks.rstrip(), args.geo)
+    print("args.save_path", args.save_path)
     if args.geo in ['box']:
         tmp_str = "g-{}-mode-{}".format(args.gamma, args.box_mode)
     elif args.geo in ['vec']:
         tmp_str = "g-{}".format(args.gamma)
     elif args.geo == 'beta':
         tmp_str = "g-{}-mode-{}".format(args.gamma, args.beta_mode)
+    elif args.geo == 'cone':
+        tmp_str = "g-{}-mode-{}".format(args.gamma, args.cone_mode)
 
     if args.checkpoint_path is not None:
         args.save_path = args.checkpoint_path
@@ -322,6 +330,7 @@ def main(args):
         gamma=args.gamma,
         geo=args.geo,
         use_cuda = args.cuda,
+        cone_mode=eval_tuple(args.cone_mode),
         box_mode=eval_tuple(args.box_mode),
         beta_mode = eval_tuple(args.beta_mode),
         test_batch_size=args.test_batch_size,
@@ -349,7 +358,7 @@ def main(args):
 
     if args.checkpoint_path is not None:
         logging.info('Loading checkpoint %s...' % args.checkpoint_path)
-        checkpoint = torch.load(os.path.join(args.checkpoint_path, 'checkpoint'))
+        checkpoint = torch.load(os.path.join(args.checkpoint_path.strip(), 'checkpoint'))
         init_step = checkpoint['step']
         model.load_state_dict(checkpoint['model_state_dict'])
 
@@ -366,6 +375,8 @@ def main(args):
         logging.info('box mode = %s' % args.box_mode)
     elif args.geo == 'beta':
         logging.info('beta mode = %s' % args.beta_mode)
+    elif args.geo == 'cone':
+        logging.info('cone mode = %s' % args.cone_mode)
     logging.info('tasks = %s' % args.tasks)
     logging.info('init_step = %d' % init_step)
     if args.do_train:
